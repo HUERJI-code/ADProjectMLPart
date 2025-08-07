@@ -5,7 +5,7 @@ import os
 from app.model_def import HybridRecommender
 
 @torch.no_grad()
-def load_model(checkpoint_path="D:/study/nus/CapstoneProject/ActivityRecommend/model/recommender_checkpoint.pth"):
+def load_model(checkpoint_path="D:/study/nus/CapstoneProject/ActivityRecommend/app/model/recommender_checkpoint.pth"):
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError("模型未训练，请先运行 train_model.py")
 
@@ -32,7 +32,7 @@ def recommend_activities(user_id, top_k):
 
     if user_id not in user_idx_map:
         raise ValueError(f"用户 {user_id} 不存在于训练数据中")
-    print(user_idx_map)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
@@ -46,16 +46,19 @@ def recommend_activities(user_id, top_k):
     tag_tensor = torch.zeros(1, max_len, dtype=torch.long).to(device)
     tag_tensor[0, :tag_len] = torch.tensor(tag_ids[:max_len]).to(device)
 
-    all_item_idx = torch.arange(len(events_df), dtype=torch.long).to(device)
+    n_items = len(events_df)
+    all_item_idx = torch.arange(n_items, dtype=torch.long).to(device)
     content_tensor = torch.tensor(activity_features, dtype=torch.float).to(device)
 
-    repeated_user = user_idx_tensor.repeat(len(events_df))
-    repeated_tag = tag_tensor.repeat(len(events_df), 1)
+    repeated_user = user_idx_tensor.repeat(n_items)
+    repeated_tag = tag_tensor.repeat(n_items, 1)
 
     scores = model(repeated_user, repeated_tag, all_item_idx, content_tensor)
 
     fav_dict = history_dict.get(user_id, {})
-    valid_mask = [item_id not in fav_dict for item_id in range(150)]
+
+    # —— 关键修改：使用实际活动数生成掩码 ——
+    valid_mask = [i not in fav_dict for i in range(n_items)]
     valid_mask = np.array(valid_mask)
 
     scores = scores[valid_mask]
@@ -66,7 +69,10 @@ def recommend_activities(user_id, top_k):
 
     recommended = events_df.iloc[valid_indices[top_idx]].copy()
     recommended['score'] = top_scores.cpu().numpy()
+
+    recommended = recommended.rename(columns={'activityid': 'id'})
     return recommended[['id', 'title', 'score']]
+
 
 @torch.no_grad()
 def recommend_similar_users(user_id, top_k=5):
@@ -104,7 +110,7 @@ def recommend_similar_users(user_id, top_k=5):
     return [(idx2uid[i.item()], top_sim[j].item()) for j, i in enumerate(top_idx)]
 
 if __name__ == "__main__":
-    uid = 10
+    uid = 11
     print("\n🔥 推荐活动:")
     print(recommend_activities(uid,5))
 
