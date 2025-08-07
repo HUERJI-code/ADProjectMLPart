@@ -1,3 +1,9 @@
+# trainmodel.py
+
+import os
+import re
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 import torch
@@ -7,22 +13,70 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import MultiLabelBinarizer
 from sklearn.model_selection import train_test_split
-import os
-import re
-from datetime import datetime
+from sqlalchemy import create_engine
+
 from app.model_def import HybridRecommender
 
-# ===== 1. 数据加载与预处理 =====
-def load_data(activity_path, interaction_path, user_path):
-    activity_df = pd.read_csv(activity_path)
-    interactions_df = pd.read_csv(interaction_path)
-    user_df = pd.read_csv(user_path)
+# —— 1. 建立数据库连接 —— 
+DB_URI = "mysql+pymysql://root@localhost/adproject"
+engine = create_engine(DB_URI)
 
-    activity_df['starttime'] = pd.to_datetime(activity_df['starttime'])
-    activity_df['endtime'] = pd.to_datetime(activity_df['endtime'])
-    activity_df['duration'] = (activity_df['endtime'] - activity_df['starttime']).dt.total_seconds() / 3600
+def load_data():
+    # —— 1.1 读取 activities 表 —— 
+    activity_df = pd.read_sql("""
+        SELECT
+          ActivityId  AS activityid,
+          Title       AS title,
+          Description AS description,
+          Location    AS content,
+          StartTime   AS starttime,
+          EndTime     AS endtime,
+          number      AS duration
+        FROM activities
+    """, engine)
 
-    # 构建交互矩阵（DataFrame）
+    # —— 1.2 解析时间字段 —— 
+    activity_df['starttime'] = pd.to_datetime(activity_df['starttime'], errors='coerce')
+    activity_df['endtime']   = pd.to_datetime(activity_df['endtime'],   errors='coerce')
+
+    # —— 1.3 读取 userfavouriteactivity 表 —— 
+    interactions_df = pd.read_sql("""
+        SELECT
+          UserId     AS userid,
+          ActivityId AS activityid,
+          1          AS favorite
+        FROM userfavouriteactivity
+    """, engine)
+
+    # —— 1.4 读取 users 表 —— 
+    user_df = pd.read_sql("""
+        SELECT
+          UserId AS userid,
+          Name,
+          Email
+        FROM users
+    """, engine)
+
+    # —— 1.5 读取 profile-标签关联，并聚合到每个用户 —— 
+    userprofiles_df = pd.read_sql("SELECT Id AS profile_id, UserId FROM userprofiles", engine)
+    upt = pd.read_sql("SELECT UserProfileId AS profile_id, TagId FROM userprofiletag", engine)
+    tags_df = pd.read_sql("SELECT TagId, Name FROM tags", engine)
+
+    # 合并拿到每条 (UserId, tagName)，对缺失的也能产生 NaN
+    upt = upt.merge(tags_df, on='TagId', how='left')
+    upt = upt.merge(userprofiles_df, on='profile_id', how='right')
+
+    # 按 UserId 聚合时，先 dropna，再 unique，再拼接
+    tag_map = (
+        upt.groupby('UserId')['Name']
+        .apply(lambda names: ','.join(names.dropna().unique().astype(str)))
+        .to_dict()
+    )
+
+    # 把 tags 写回 user_df，缺失用户填空字符串
+    user_df['tags'] = user_df['userid'].map(tag_map).fillna('')
+
+    # —— 1.6 构造交互矩阵 —— 
     interaction_matrix = interactions_df.pivot_table(
         index='userid',
         columns='activityid',
@@ -30,195 +84,191 @@ def load_data(activity_path, interaction_path, user_path):
         aggfunc='max'
     ).fillna(0).astype(int)
 
-    # 构建用户历史字典（Dict）
-    user_history_dict = interactions_df[interactions_df['favorite'] > 0].groupby('userid')['activityid'].apply(list).to_dict()
+    # —— 1.7 补全所有出现过的用户，即使他们没 profile/标签 —— 
+    missing = set(interaction_matrix.index) - set(user_df['userid'])
+    if missing:
+        extra = pd.DataFrame({
+            'userid': list(missing),
+            'Name': [''] * len(missing),
+            'Email': [''] * len(missing),
+            'tags': [''] * len(missing)
+        })
+        user_df = pd.concat([user_df, extra], ignore_index=True)
 
-    return activity_df, interactions_df, user_df, interaction_matrix, user_history_dict
+    # 按 interaction_matrix 的索引顺序重排
+    user_df = user_df.set_index('userid').reindex(interaction_matrix.index).reset_index()
 
-# ===== 2. 特征工程类 =====
+    # —— 1.8 用户历史记录字典 —— 
+    user_history = {
+        uid: interaction_matrix.loc[uid].to_dict()
+        for uid in interaction_matrix.index
+    }
+
+    return activity_df, interactions_df, user_df, interaction_matrix, user_history
+
+
+# ===== 以下保持原有特征工程、Dataset、训练流程，只需在初始化模型时做 num_user_tags ≥1 的兜底处理 =====
+
 class ActivityFeatureEngineer:
     def __init__(self):
         self.text_vectorizer = TfidfVectorizer(max_features=300, stop_words='english')
-        self.tag_encoder = MultiLabelBinarizer()
+        self.tag_encoder     = MultiLabelBinarizer()
 
     def preprocess_tags(self, tags):
-        if pd.isna(tags): return []
-        return [tag.strip() for tag in re.split(r'[/,]', tags) if tag.strip()]
+        if pd.isna(tags) or not tags:
+            return []
+        return [t.strip() for t in re.split(r'[/,]', tags) if t.strip()]
 
     def extract_features(self, df):
-        df['combined_text'] = df['title'].fillna('') + ' ' + df['description'].fillna('') + ' ' + df['content'].fillna('')
-        tfidf = self.text_vectorizer.fit_transform(df['combined_text'])
+        df['combined_text'] = (
+                df['title'].fillna('') + ' '
+                + df['description'].fillna('') + ' '
+                + df['content'].fillna('')
+        )
+        tfidf    = self.text_vectorizer.fit_transform(df['combined_text'])
+        df['tag_list'] = df['combined_text'].apply(lambda _: [])  # placeholder
+        tags_mat = self.tag_encoder.fit_transform(df['tag_list'])
 
-        df['tag_list'] = df['tag'].apply(self.preprocess_tags)
-        tags = self.tag_encoder.fit_transform(df['tag_list'])
-
-        df['hour'] = df['starttime'].dt.hour
+        df['hour']     = df['starttime'].dt.hour.fillna(0).astype(int)
         df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
         df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
-        time_feat = df[['hour_sin', 'hour_cos', 'duration']].values
+        time_feat     = df[['hour_sin', 'hour_cos', 'duration']].values
 
-        features = np.hstack([tfidf.toarray(), tags, time_feat])
+        features = np.hstack([tfidf.toarray(), tags_mat, time_feat])
         return features, self.tag_encoder.classes_
+
 
 class UserFeatureEngineer:
     def __init__(self):
         self.tag_encoder = MultiLabelBinarizer()
 
     def preprocess_tags(self, tags):
-        if pd.isna(tags): return []
-        return [tag.strip() for tag in re.split(r'[/,]', tags) if tag.strip()]
+        if pd.isna(tags) or not tags:
+            return []
+        return [t.strip() for t in re.split(r'[/,]', tags) if t.strip()]
 
     def extract_user_features(self, user_df):
         user_df['tag_list'] = user_df['tags'].apply(self.preprocess_tags)
-        one_hot_tags = self.tag_encoder.fit_transform(user_df['tag_list'])
-        tag_to_idx = {tag: i for i, tag in enumerate(self.tag_encoder.classes_)}
-        user_tag_indices = [
-            [tag_to_idx[tag] for tag in tags if tag in tag_to_idx]
+        one_hot            = self.tag_encoder.fit_transform(user_df['tag_list'])
+        tag_to_idx         = {t: i for i, t in enumerate(self.tag_encoder.classes_)}
+        user_tag_indices   = [
+            [tag_to_idx[t] for t in tags if t in tag_to_idx]
             for tags in user_df['tag_list']
         ]
         return user_tag_indices, self.tag_encoder.classes_, tag_to_idx
 
-# ===== 3. Dataset 类 =====
+
 class CustomDataset(Dataset):
     def __init__(self, interaction_matrix, activity_features, user_tag_indices):
         self.users, self.items, self.labels = [], [], []
         self.activity_features = activity_features
-        self.user_tag_indices = user_tag_indices
+        self.user_tag_indices  = user_tag_indices
         self.user_map = {u: i for i, u in enumerate(interaction_matrix.index)}
         self.item_map = {i: j for j, i in enumerate(interaction_matrix.columns)}
 
-        for user_id in interaction_matrix.index:
-            user_idx = self.user_map[user_id]
-            for item_id in interaction_matrix.columns:
-                item_idx = self.item_map[item_id]
-                interaction_value = interaction_matrix.at[user_id, item_id]
-
-                if interaction_value in [1, 2]:
-                    label = 1
-                else:
-                    label = 0
-
-                self.users.append(user_idx)
-                self.items.append(item_idx)
-                self.labels.append(label)
+        for uid in interaction_matrix.index:
+            uidx = self.user_map[uid]
+            for aid in interaction_matrix.columns:
+                iidx = self.item_map[aid]
+                val  = interaction_matrix.at[uid, aid]
+                lbl  = 1 if val in (1, 2) else 0
+                self.users.append(uidx)
+                self.items.append(iidx)
+                self.labels.append(lbl)
 
     def __len__(self):
         return len(self.users)
 
     def __getitem__(self, idx):
-        user_idx = self.users[idx]
-        user_tags = self.user_tag_indices[user_idx]
-        max_len = 10
-        tag_tensor = torch.zeros(max_len, dtype=torch.long)
-        tag_tensor[:len(user_tags[:max_len])] = torch.tensor(user_tags[:max_len])
-
+        uidx      = self.users[idx]
+        iidx      = self.items[idx]
+        tags      = self.user_tag_indices[uidx][:10]
+        tag_tensor= torch.zeros(10, dtype=torch.long)
+        tag_tensor[:len(tags)] = torch.tensor(tags, dtype=torch.long)
         return (
-            torch.tensor(user_idx, dtype=torch.long),
+            torch.tensor(uidx, dtype=torch.long),
             tag_tensor,
-            torch.tensor(self.items[idx], dtype=torch.long),
-            torch.tensor(self.activity_features[self.items[idx]], dtype=torch.float),
-            torch.tensor(self.labels[idx], dtype=torch.float)
+            torch.tensor(iidx, dtype=torch.long),
+            torch.tensor(self.activity_features[iidx], dtype=torch.float),
+            torch.tensor(self.labels[idx], dtype=torch.float),
         )
 
-# ===== 4. 训练主函数 =====
-def train_model(model, train_loader, val_loader, epochs=100, lr=0.001):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.BCELoss()
 
+def train_model(model, train_loader, val_loader, epochs=100, lr=1e-3):
+    device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    optimizer= optim.Adam(model.parameters(), lr=lr)
+    criterion= nn.BCELoss()
     for epoch in range(epochs):
         model.train()
         total_loss = 0
-        # 关键修正：匹配数据集的返回项
-        for user_ids, user_tags, item_ids, content, label in train_loader:
-            user_ids, user_tags, item_ids, content, label = (
-                user_ids.to(device),
-                user_tags.to(device),
-                item_ids.to(device),
-                content.to(device),
-                label.to(device)
-            )
-
+        for uids, tags, iids, feats, lbls in train_loader:
+            uids, tags, iids, feats, lbls = [x.to(device) for x in (uids, tags, iids, feats, lbls)]
             optimizer.zero_grad()
-            output = model(user_ids, user_tags, item_ids, content)
-            loss = criterion(output, label)
+            preds = model(uids, tags, iids, feats)
+            loss  = criterion(preds, lbls)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(train_loader):.4f}")
+        print(f"Epoch {epoch+1}/{epochs} – Loss: {total_loss/len(train_loader):.4f}")
     return model
 
 
-# ===== 5. 检查是否需更新模型 =====
-def should_update_model(old_user_ids, old_item_ids, new_user_ids, new_item_ids):
-    return (True)#len(set(new_user_ids) - set(old_user_ids)) > 0 or len(set(new_item_ids) - set(old_item_ids)) >= 10)
+def should_update_model(old_uids, old_iids, new_uids, new_iids):
+    return True
 
-# ===== 6. 主流程 =====
+
 if __name__ == "__main__":
-    act_file = "../data/activity.csv"
-    int_file = "../data/useractivityevaluations.csv"
-    user_file = "../data/user.csv"
-    model_path = "../model/recommender_checkpoint.pth"
+    act_df, inter_df, user_df, inter_mat, user_hist = load_data()
+    act_feats, act_tags   = ActivityFeatureEngineer().extract_features(act_df)
+    user_idxs, user_tags, tag_map = UserFeatureEngineer().extract_user_features(user_df)
 
-    # 加载活动数据和用户数据
-    events_df, interactions_df, user_df, interaction_matrix, user_history = load_data(act_file, int_file, user_file)
+    dataset     = CustomDataset(inter_mat, act_feats, user_idxs)
+    train_set, val_set = train_test_split(dataset, test_size=0.2, random_state=42)
+    train_loader = DataLoader(train_set, batch_size=128, shuffle=True)
+    val_loader   = DataLoader(val_set, batch_size=128)
 
-    # 特征工程
-    activity_engineer = ActivityFeatureEngineer()
-    user_engineer = UserFeatureEngineer()
+    # —— 保底 num_user_tags ≥ 1 —— 
+    real_tags = len(user_tags)
+    safe_tags = real_tags if real_tags > 0 else 1
 
-    activity_features, activity_tag_classes = activity_engineer.extract_features(events_df)
-    user_tag_indices, user_tag_classes, tag_to_idx = user_engineer.extract_user_features(user_df)
-
-    # 创建数据集
-    dataset = CustomDataset(interaction_matrix, activity_features, user_tag_indices)
-    train_data, val_data = train_test_split(dataset, test_size=0.2, random_state=42)
-    train_loader = DataLoader(train_data, batch_size=128, shuffle=True)
-    val_loader = DataLoader(val_data, batch_size=128)
-
-    # 模型初始化
     model = HybridRecommender(
-        num_users=len(interaction_matrix.index),
-        num_user_tags=len(user_tag_classes),
-        num_items=len(events_df),  # 保证用全量活动数量
-        content_dim=activity_features.shape[1]
+        num_users     = len(inter_mat.index),
+        num_user_tags = safe_tags,
+        num_items     = len(act_df),
+        content_dim   = act_feats.shape[1]
     )
 
-    if os.path.exists(model_path):
-        checkpoint = torch.load(model_path, map_location='cpu')
+    model_dir = Path("model")
+    model_dir.mkdir(exist_ok=True)
+    ckpt_path = model_dir / "recommender_checkpoint.pth"
+
+    if ckpt_path.exists():
+        ckpt = torch.load(ckpt_path, map_location="cpu")
         if not should_update_model(
-                checkpoint['user_idx_map'].keys(),
-                checkpoint['item_idx_map'].keys(),
-                interaction_matrix.index,
-                interaction_matrix.columns
+                ckpt['user_idx_map'].keys(),
+                ckpt['item_idx_map'].keys(),
+                inter_mat.index,
+                inter_mat.columns
         ):
             print("✅ 无需更新模型")
             exit()
 
-    trained_model = train_model(model, train_loader, val_loader, epochs=100)
-    os.makedirs("../model", exist_ok=True)
-
+    trained = train_model(model, train_loader, val_loader, epochs=100)
     torch.save({
-        "model_state_dict": trained_model.state_dict(),
+        "model_state_dict": trained.state_dict(),
         "model_config": {
-            "num_users": len(interaction_matrix.index),
-            "num_user_tags": len(user_tag_classes),
-            "num_items": len(events_df),
-            "content_dim": activity_features.shape[1],
-            "embedding_dim": 128,
-            "user_feature_dim": 64
+            "num_users": len(inter_mat.index),
+            "num_user_tags": safe_tags,
+            "num_items": len(act_df),
+            "content_dim": act_feats.shape[1]
         },
-        "user_tag_encoder": user_engineer.tag_encoder,
-        "tag_to_idx": tag_to_idx,
-        "activity_features": activity_features,
+        "user_tag_encoder": tag_map,
+        "activity_features": act_feats,
         "user_idx_map": {u: i for i, u in enumerate(user_df['userid'])},
-        "item_idx_map": {i: j for j, i in enumerate(events_df['id'])},
-        "events_info": events_df,
-        "user_history_dict": user_history,
-        "user_tag_indices": user_tag_indices
-    }, model_path)
+        "item_idx_map": {i: j for j, i in enumerate(act_df['activityid'])},
+        "user_history": user_hist
+    }, ckpt_path)
 
 
 
