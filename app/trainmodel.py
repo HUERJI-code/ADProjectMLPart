@@ -72,11 +72,9 @@ def load_data():
         "SELECT TagId, Name FROM tags", engine
     )
 
-    # 合并拿到每条 (UserId, tagName)
     upt = upt.merge(tags_df, on='TagId', how='left')
     upt = upt.merge(userprofiles_df, on='profile_id', how='right')
 
-    # 聚合成 "tag1,tag2" 字符串
     tag_map = (
         upt.groupby('UserId')['Name']
         .apply(lambda names: ','.join(names.dropna().unique().astype(str)))
@@ -92,21 +90,15 @@ def load_data():
         aggfunc='max'
     ).fillna(0).astype(int)
 
-    # —— 1.7 补全所有出现过的用户，即使他们没 profile/标签 ——
-    missing = set(interaction_matrix.index) - set(user_df['userid'])
-    if missing:
-        extra = pd.DataFrame({
-            'userid': list(missing),
-            'Name': [''] * len(missing),
-            'Email': [''] * len(missing),
-            'tags': [''] * len(missing)
-        })
-        user_df = pd.concat([user_df, extra], ignore_index=True)
+    # —— ✅ 补充：确保所有用户都在交互矩阵中（即使没有交互记录） ——
+    all_user_ids = user_df['userid'].unique()
+    interaction_matrix = interaction_matrix.reindex(
+        index=all_user_ids,
+        fill_value=0
+    )
 
-    # 按交互矩阵用户顺序重排 user_df
-    user_df = user_df.set_index('userid') \
-        .reindex(interaction_matrix.index) \
-        .reset_index()
+    # —— 1.7（可选）按用户原始顺序重排 user_df ——
+    user_df = user_df.set_index('userid').loc[all_user_ids].reset_index()
 
     # —— 1.8 用户历史记录字典 ——
     user_history = {
@@ -115,6 +107,7 @@ def load_data():
     }
 
     return activity_df, interactions_df, user_df, interaction_matrix, user_history
+
 
 
 # ===== 2. 特征工程 =====

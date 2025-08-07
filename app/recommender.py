@@ -30,6 +30,8 @@ def load_model(checkpoint_path="D:/study/nus/CapstoneProject/ActivityRecommend/a
 def recommend_activities(user_id, top_k):
     model, activity_features, user_tag_indices, user_idx_map, item_idx_map, events_df, history_dict, _ = load_model()
 
+    print(user_idx_map);
+
     if user_id not in user_idx_map:
         raise ValueError(f"用户 {user_id} 不存在于训练数据中")
 
@@ -110,7 +112,7 @@ def recommend_similar_users(user_id, top_k=5):
     return [(idx2uid[i.item()], top_sim[j].item()) for j, i in enumerate(top_idx)]
 
 if __name__ == "__main__":
-    uid = 11
+    uid = 4
     print("\n🔥 推荐活动:")
     print(recommend_activities(uid,5))
 

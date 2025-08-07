@@ -2,7 +2,9 @@
 
 # python -m uvicorn app.main:app --reload --port 8000
 
-from fastapi import FastAPI
+import os
+import subprocess
+from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 from app.recommender import recommend_activities, recommend_similar_users
 
@@ -55,3 +57,28 @@ def similar_users(request: SimilarUserRequest):
         "user_id": request.user_id,
         "similar_users": sim_users
     }
+
+def _run_retraining():
+    """
+    在子进程中调用 trainmodel 脚本重新训练并保存模型。
+    注意：请确保你的 trainmodel.py
+    顶层模块名是 app.trainmodel，且可以使用 `python -m app.trainmodel` 方式运行。
+    """
+    # 切到项目根目录，避免路径问题
+    cwd = os.getcwd()
+    # 启动子进程执行重训脚本
+    subprocess.run(
+        ["python", "-m", "app.trainmodel"],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+@app.get("/retrain/")
+def retrain(background_tasks: BackgroundTasks):
+    """
+    异步触发模型重训练。立即返回，由后台任务去执行 trainmodel.py。
+    """
+    background_tasks.add_task(_run_retraining)
+    return {"message": "Model retraining has been started in background."}
